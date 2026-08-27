@@ -1,0 +1,102 @@
+name: Sync LLVM Upstream
+
+# This workflow lives on the `fork-admin` branch, which is this repository's
+# default branch. That is deliberate and load-bearing:
+#
+#   * GitHub only runs `schedule` triggers from the DEFAULT branch, so this
+#     file has to live on whatever branch is default.
+#   * Keeping it off `main` means `main` contains zero fork-specific commits.
+#     It is a byte-for-byte mirror of llvm/llvm-project@main, with identical
+#     commit SHAs, so branches cut from it produce clean upstream PRs and
+#     `git rebase main` behaves exactly like rebasing on upstream.
+#   * As a side effect, upstream's own scheduled workflows (which live on
+#     `main`) no longer fire in this fork, since `main` is not the default
+#     branch any more.
+#
+# See README.md on this branch.
+
+on:
+  schedule:
+    # Runs every 4 hours (adjust cron syntax as preferred)
+    - cron: '0 */4 * * *'
+  workflow_dispatch: # Allows you to manually trigger via the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  # Two concurrent syncs racing on the same ref would be pointless at best.
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      # NOT secrets.GITHUB_TOKEN. Upstream commits routinely touch
+      # .github/workflows/, and moving a ref across those commits requires the
+      # `workflow` scope, which the automatic GITHUB_TOKEN can never have.
+      # SYNC_TOKEN must be a PAT with `repo` + `workflow` (classic), or
+      # Contents: write + Workflows: write (fine-grained).
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+      FORK: ${{ github.repository }}
+      UPSTREAM_OWNER: llvm
+      UPSTREAM_REPO: llvm-project
+      BRANCH: main
+
+    steps:
+      - name: Check sync token is configured
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::SYNC_TOKEN secret is not set. Create a PAT with 'repo' and 'workflow' scope and add it as a repository secret named SYNC_TOKEN."
+            exit 1
+          fi
+
+      # No clone. This repo is ~3.6 GB; a fast-forward is just a ref update, so
+      # the whole sync is three API calls and finishes in seconds.
+      - name: Fast-forward main to upstream
+        run: |
+          set -euo pipefail
+
+          upstream="${UPSTREAM_OWNER}/${UPSTREAM_REPO}"
+          up=$(gh api "repos/${upstream}/commits/${BRANCH}" --jq .sha)
+          mine=$(gh api "repos/${FORK}/commits/${BRANCH}" --jq .sha)
+
+          echo "upstream ${BRANCH}: ${up}"
+          echo "fork     ${BRANCH}: ${mine}"
+
+          if [ "${up}" = "${mine}" ]; then
+            echo "Already in sync."
+            exit 0
+          fi
+
+          # Guard: refuse to touch main unless it is a strict ancestor of
+          # upstream. "diverged" means someone committed directly to main,
+          # which should never happen for a mirror -- fail loudly rather than
+          # silently discarding that work.
+          status=$(gh api \
+            "repos/${FORK}/compare/${mine}...${UPSTREAM_OWNER}:${UPSTREAM_REPO}:${BRANCH}" \
+            --jq .status)
+          echo "compare status: ${status}"
+
+          case "${status}" in
+            identical)
+              echo "Already in sync."
+              exit 0
+              ;;
+            ahead)
+              # Upstream is ahead of us: a clean fast-forward.
+              ;;
+            *)
+              echo "::error::${BRANCH} is '${status}' relative to upstream, so it cannot be fast-forwarded. This branch is meant to be a pure mirror -- move any local commits to a topic branch, reset ${BRANCH} to upstream, then re-run."
+              exit 1
+              ;;
+          esac
+
+          # force=false makes GitHub itself enforce fast-forward-only, so a
+          # race between the check above and this call cannot lose commits.
+          gh api -X PATCH "repos/${FORK}/git/refs/heads/${BRANCH}" \
+            -f sha="${up}" \
+            -F force=false \
+            --jq '.object.sha' \
+            | xargs -I{} echo "main is now at {}"
